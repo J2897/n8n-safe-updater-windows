@@ -63,24 +63,35 @@ function Get-Json {
 # NODE UNINSTALL
 # ---------------------------------------------------------------
 function Uninstall-Node {
-    Write-Host "Removing existing Node.js..."
+    Write-Host "Checking for existing Node.js installations..."
 
     $unKeys = @(
         "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
         "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
     )
 
-    $products = Get-ItemProperty -Path $unKeys -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -like "*Node.js*" }
+    $products = @(
+        Get-ItemProperty -Path $unKeys -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like "*Node.js*" }
+    )
+
+    if (-not $products -or $products.Count -eq 0) {
+        Write-Host "No existing Node.js installation found; nothing to remove."
+        return
+    }
+
+    Write-Host "Removing existing Node.js installation(s)..."
 
     foreach ($p in $products) {
         $uninst = $p.UninstallString
 
         if ($uninst -match '{[0-9A-Fa-f\-]+}') {
             $guid = [regex]::Match($uninst, '{[0-9A-Fa-f\-]+}').Value
+            Write-Host "Uninstalling $($p.DisplayName) via MSI GUID $guid ..."
             Start-Process msiexec.exe -Wait -ArgumentList "/x $guid /quiet /norestart"
         }
         elseif ($uninst) {
+            Write-Host "Uninstalling $($p.DisplayName) via command line..."
             Start-Process cmd.exe -Wait -ArgumentList "/c `"$uninst`""
         }
     }
@@ -160,7 +171,7 @@ function Repair-Path {
 }
 
 # ---------------------------------------------------------------
-# INSTALL n8n (PATCH 3 APPLIED)
+# INSTALL n8n
 # ---------------------------------------------------------------
 function Install-N8N {
     param([string]$Version)
@@ -173,18 +184,41 @@ function Install-N8N {
     if (-not (Test-Path $npmRoot))  { New-Item -ItemType Directory -Path $npmRoot  -Force | Out-Null }
     if (-not (Test-Path $npmCache)) { New-Item -ItemType Directory -Path $npmCache -Force | Out-Null }
 
-    Write-Host "Running: npm install -g n8n@$Version (raw mode)"
-    $npmOutput = cmd.exe /c "npm install -g n8n@$Version 2>&1"
-    Write-Host $npmOutput
+    # Give npm (node) enough heap to survive large installs on Windows.
+    # Heuristic: heap = clamp(2048 .. 4096, freeRAM - 512)
+    $freeRamMb = 2048
+    try {
+        $freeRamMb = [int](Get-Counter '\Memory\Available MBytes' -ErrorAction Stop).CounterSamples[0].CookedValue
+    } catch { }
 
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "ERROR: npm failed to install n8n."
+    $heapMb = [math]::Min(4096, [math]::Max(2048, $freeRamMb - 512))
+    $semiMb = if ($freeRamMb -ge 3500) { 128 } else { 64 }  # helps "NewSpace" OOMs
+
+    $npmArgs = "install -g n8n@$Version --legacy-peer-deps --no-audit --no-fund"
+    $cmd = "set `"NODE_OPTIONS=--max-old-space-size=$heapMb --max-semi-space-size=$semiMb`"&& npm $npmArgs"
+
+    Write-Host "Running: npm $npmArgs (raw mode)  [NODE_OPTIONS: old=$heapMb, semi=$semiMb]"
+    $npmOutput = & cmd.exe /d /c "$cmd 2>&1"
+    $exitCode  = $LASTEXITCODE
+
+    if ($npmOutput) {
+        Write-Host ($npmOutput -join "`r`n")
+    } else {
+        Write-Host "(npm produced no output)"
+    }
+
+    if ($exitCode -ne 0) {
+        Write-Host "ERROR: npm failed to install n8n (exit code $exitCode)."
         exit 1
     }
 
     Write-Host "Rebuilding npm shims..."
-    $rebuild = cmd.exe /c "npm rebuild -g 2>&1"
-    Write-Host $rebuild
+    $rebuildOut = & cmd.exe /d /c "npm rebuild -g 2>&1"
+    $rebuildCode = $LASTEXITCODE
+    if ($rebuildOut) { Write-Host ($rebuildOut -join "`r`n") }
+    if ($rebuildCode -ne 0) {
+        Write-Host "WARNING: npm rebuild -g failed (exit code $rebuildCode). Continuing anyway..."
+    }
 
     $exe = Join-Path $npmRoot "n8n.cmd"
     if (-not (Test-Path $exe)) {
@@ -198,11 +232,160 @@ function Install-N8N {
         exit 1
     }
 
+    Repair-N8NAjv
+
     Write-Host "Installed n8n $resolved"
 }
 
 # ---------------------------------------------------------------
-# BACKUP (unchanged)
+# REPAIR n8n AJV DEPENDENCY (ajv@8) TO AVOID ajv/dist/core ERRORS
+# ---------------------------------------------------------------
+function Repair-N8NAjv {
+    Write-Host "Repairing n8n Ajv dependency (ajv@8)..." -ForegroundColor Cyan
+
+    $npm = Get-Command npm -ErrorAction SilentlyContinue
+    if (-not $npm) {
+        Write-Host "npm not found on PATH, skipping Ajv repair."
+        return
+    }
+
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $node) {
+        Write-Host "node not found on PATH, skipping Ajv repair."
+        return
+    }
+
+    $globalRoot = & $npm.Source root -g
+    if (-not $globalRoot) {
+        Write-Host "Could not determine global npm root, skipping Ajv repair."
+        return
+    }
+
+    $n8nDir = Join-Path $globalRoot "n8n"
+    if (-not (Test-Path $n8nDir)) {
+        Write-Host "n8n not found under '$n8nDir', skipping Ajv repair."
+        return
+    }
+
+    Push-Location $n8nDir
+    try {
+        # 1) Check if ajv/dist/core is already resolvable
+        Write-Host "Checking if ajv/dist/core is already available..."
+
+        $ajvOk = $false
+        try {
+            & $node.Source -e "require('ajv/dist/core');" 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $ajvOk = $true
+            }
+        }
+        catch {
+            # NativeCommandError is expected here if the module is missing.
+            $ajvOk = $false
+            $Error.Clear()
+        }
+
+        if ($ajvOk) {
+            Write-Host "Ajv core is already resolvable; no changes needed." -ForegroundColor Green
+            return
+        }
+
+        Write-Host "Ajv core not found; installing ajv@8 into n8n's node_modules..."
+        & $npm.Source install ajv@8 --omit=dev --no-save --legacy-peer-deps --no-audit --no-fund --no-package-lock
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "WARNING: npm install ajv@8 failed with exit code $LASTEXITCODE"
+            return
+        }
+
+        $ajvCorePath = Join-Path $n8nDir "node_modules\ajv\dist\core.js"
+        if (Test-Path $ajvCorePath) {
+            Write-Host "Ajv core present at: $ajvCorePath"
+        } else {
+            Write-Host "WARNING: ajv installed, but dist/core.js not found at $ajvCorePath"
+        }
+
+        # 2) Re-check after install (again, non-fatal)
+        $ajvOk = $false
+        try {
+            & $node.Source -e "require('ajv/dist/core');" 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $ajvOk = $true
+            }
+        }
+        catch {
+            $ajvOk = $false
+            $Error.Clear()
+        }
+
+        if ($ajvOk) {
+            Write-Host "Ajv core import OK after repair." -ForegroundColor Green
+        } else {
+            Write-Host "WARNING: Node still cannot require('ajv/dist/core') after repair (exit code $LASTEXITCODE)"
+        }
+    }
+    finally {
+        Pop-Location
+    }
+
+    Write-Host "Ajv repair complete." -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------
+# ENSURE BASIC n8n ENVIRONMENT DEFAULTS (.n8n\.env)
+# ---------------------------------------------------------------
+function Ensure-N8NEnvDefaults {
+    Write-Host "Ensuring basic n8n environment defaults (.n8n\.env)..." -ForegroundColor Cyan
+
+    $userFolder = Join-Path $env:USERPROFILE ".n8n"
+    if (-not (Test-Path $userFolder)) {
+        New-Item -ItemType Directory -Path $userFolder -Force | Out-Null
+    }
+
+    $envPath = Join-Path $userFolder ".env"
+
+    $desired = [ordered]@{
+        "DB_SQLITE_POOL_SIZE"             = "5"
+        "N8N_RUNNERS_ENABLED"             = "true"
+        "N8N_BLOCK_ENV_ACCESS_IN_NODE"    = "false"
+        "N8N_GIT_NODE_DISABLE_BARE_REPOS" = "true"
+    }
+
+    if (Test-Path $envPath) {
+        $lines = Get-Content -Path $envPath -ErrorAction SilentlyContinue
+        if (-not $lines) { $lines = @() }
+
+        foreach ($key in $desired.Keys) {
+            $pattern = "^\s*" + [regex]::Escape($key) + "\s*="
+            $index = $null
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match $pattern) {
+                    $index = $i
+                    break
+                }
+            }
+
+            $newLine = "$key=$($desired[$key])"
+            if ($null -ne $index) {
+                $lines[$index] = $newLine
+            } else {
+                $lines += $newLine
+            }
+        }
+
+        Set-Content -Path $envPath -Value $lines -Encoding UTF8
+    } else {
+        $content = @()
+        foreach ($entry in $desired.GetEnumerator()) {
+            $content += "$($entry.Key)=$($entry.Value)"
+        }
+        Set-Content -Path $envPath -Value $content -Encoding UTF8
+    }
+
+    Write-Host "n8n .env defaults ensured at: $envPath" -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------
+# BACKUP
 # ---------------------------------------------------------------
 function Backup-N8N {
     $n8nDir = Join-Path $env:USERPROFILE ".n8n"
@@ -229,7 +412,8 @@ function Backup-N8N {
 
     try {
         Copy-Item "$n8nDir\*" $tempCopy -Recurse -Force
-        Compress-Archive -Path $tempCopy -DestinationPath $zipPath -Force
+        # Compress-Archive -Path $tempCopy -DestinationPath $zipPath -Force
+        Compress-Archive -Path (Join-Path $tempCopy '*') -DestinationPath $zipPath -Force
     }
     finally {
         if (Test-Path $tempCopy) {
@@ -379,17 +563,24 @@ Write-Host "npm:  $installedNpm"
 # INSTALL / UPDATE n8n
 # ---------------------------------------------------------------
 $currentN8n = Try-Command "n8n --version"
+$didInstall = $false
 
-if ($currentN8n) {
-    if ($currentN8n.Trim() -ne $latestN8n) {
-        Install-N8N $latestN8n
-    } else {
-        Write-Host "n8n is already up-to-date."
-    }
-} else {
+if (-not $currentN8n -or $currentN8n.Trim() -ne $latestN8n) {
     Install-N8N $latestN8n
+    $didInstall = $true
+} else {
+    Write-Host "n8n is already up-to-date."
 }
 
+Repair-N8NAjv
+Ensure-N8NEnvDefaults
+
 Write-Host ""
-Write-Host "SUCCESS: n8n $latestN8n installed on Node $installedNode"
+
+if ($didInstall) {
+    Write-Host "SUCCESS: n8n $latestN8n installed on Node $installedNode"
+} else {
+    Write-Host "SUCCESS: n8n $latestN8n ready on Node $installedNode"
+}
+
 Write-Host "Use launch-n8n.ps1 to start n8n."

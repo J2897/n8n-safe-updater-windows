@@ -45,18 +45,18 @@ This script eliminates all of those problems by enforcing a clean, validated, fu
 
 1. Download the script:
 
-  ```powershell
-    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/J2897/n8n-safe-updater-windows/main/n8n-safe-updater.ps1" -OutFile "n8n-safe-updater.ps1"
-  ```
+   ```powershell
+   Invoke-WebRequest -Uri "https://raw.githubusercontent.com/J2897/n8n-safe-updater-windows/main/n8n-safe-updater.ps1" -OutFile "n8n-safe-updater.ps1"
+   ```
 
 2. Run it:
 
-  * Right-click the file → **Run with PowerShell**, *or*
-  * Open an elevated PowerShell session and run:
+   * Right-click the file → **Run with PowerShell**, *or*
+   * Open an elevated PowerShell session and run:
 
-    ```powershell
+      ```powershell
       ./n8n-safe-updater.ps1
-    ```
+      ```
 
 The script will automatically:
 
@@ -69,7 +69,7 @@ The script will automatically:
 
 Start n8n the usual way:
 
-```powershell
+```cmd
 n8n start
 ```
 
@@ -77,7 +77,7 @@ n8n start
 
 Backups are stored here:
 
-```
+```cmd
 %USERPROFILE%\Desktop\n8n-backups\n8n-backup-YYYY-MM-DD_HH-mm-ss.zip
 ```
 
