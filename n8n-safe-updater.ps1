@@ -582,5 +582,3 @@ if ($didInstall) {
 } else {
     Write-Host "SUCCESS: n8n $latestN8n ready on Node $installedNode"
 }
-
-Write-Host "Use launch-n8n.ps1 to start n8n."
