@@ -83,6 +83,19 @@ Backups are stored here:
 
 Each backup is self-contained and timestamped so you can keep multiple versions safely.
 
+## Export/import your n8n data
+
+This repo also includes **`n8n-export-import.ps1`** for exporting and importing n8n data:
+
+- Entities (`export:entities` / `import:entities`)
+- Workflows (`export:workflow` / `import:workflow`)
+- Credentials (encrypted backup or decrypted export)
+- Optional `.n8n` snapshot zip (and restore)
+
+The script supports interactive menus and `-WhatIf`/`-Confirm` for safe dry runs, and is compatible with **Windows PowerShell 5.1** and **PowerShell 7+** (Windows).
+
+See **`n8n-export-import.md`** for the usage guide and examples.
+
 ## Troubleshooting
 
 |Issue                                                  |Solution                                                                                           |
